@@ -1,5 +1,4 @@
 from django.db import models
-<<<<<<< variant A
 from django.utils import six
 from django.utils.translation import ugettext as _
 #import signals
