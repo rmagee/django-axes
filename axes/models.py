@@ -59,8 +59,7 @@ class AccessLog(CommonAccess):
                                        help_text=_('The date and time the user last logged out of the system.'))
 
     def __unicode__(self):
-        return u'Access Log for %s @ %s' % (self.username, self.attempt_time)
+        return six.u('Access Log for %s @ %s') % (self.username, self.attempt_time)        
     
     class Meta():
         verbose_name = 'Access Log'
-        return six.u('Access Log for %s @ %s') % (self.username, self.attempt_time)
