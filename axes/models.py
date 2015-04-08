@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import six
 from django.utils.translation import ugettext as _
 #import signals
 FAILURES_DESC = 'Failed Logins'
@@ -30,6 +31,7 @@ class CommonAccess(models.Model):
         abstract = True
         ordering = ['-attempt_time']
 
+
 class AccessAttempt(CommonAccess):
     get_data = models.TextField(verbose_name=_('GET Data'), 
                                 help_text=_('The GET HTTP data supplied in the URL of the last request.'))
@@ -48,12 +50,16 @@ class AccessAttempt(CommonAccess):
     class Meta():
         verbose_name = _('Access Attempt')
 
+    def __unicode__(self):
+        return six.u('Attempted Access: %s') % self.attempt_time
+
+
 class AccessLog(CommonAccess):
     logout_time = models.DateTimeField(null=True, blank=True, verbose_name=_('Logout Time'),
                                        help_text=_('The date and time the user last logged out of the system.'))
 
     def __unicode__(self):
-        return u'Access Log for %s @ %s' % (self.username, self.attempt_time)
+        return six.u('Access Log for %s @ %s') % (self.username, self.attempt_time)        
     
     class Meta():
         verbose_name = 'Access Log'

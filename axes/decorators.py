@@ -1,31 +1,36 @@
-try:
-    from functools import wraps
-except ImportError:
-    from django.utils.functional import wraps  # Python 2.4 fallback.
+import logging
+import socket
 
 from datetime import timedelta
-import logging
 
 from django.conf import settings
-from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.models import User
-from django import http
-from django.http import HttpResponse, HttpResponseRedirect
+from django.contrib.auth import logout
+from django.core.exceptions import ObjectDoesNotExist
+from django.http import HttpResponse
+from django.http import HttpResponseRedirect
 from django.shortcuts import render_to_response
-from django import template
 from django.template import RequestContext
-from django.utils.translation import ugettext_lazy, ugettext as _
+from django.utils import timezone as datetime
+from django.utils.translation import ugettext_lazy
 
-# Use the timezone support in Django >= 1.4 if it's available.
 try:
-    from django.utils import timezone as datetime
-except ImportError:
-    # Fallback for Django < 1.4.
-    from datetime import datetime
+    from django.contrib.auth import get_user_model
+except ImportError:  # django < 1.5
+    from django.contrib.auth.models import User
+else:
+    User = get_user_model()
 
-from axes.models import AccessAttempt, AccessLog
+try:
+    from django.contrib.auth.models import SiteProfileNotAvailable
+except ImportError: # django >= 1.7
+    SiteProfileNotAvailable = type('SiteProfileNotAvailable', (Exception,), {})
+
+from axes.models import AccessLog
+from axes.models import AccessAttempt
 from axes.signals import user_locked_out
 import axes
+from django.utils import six
+
 
 # see if the user has overridden the failure limit
 FAILURE_LIMIT = getattr(settings, 'AXES_LOGIN_FAILURE_LIMIT', 3)
@@ -35,15 +40,24 @@ LOCK_OUT_AT_FAILURE = getattr(settings, 'AXES_LOCK_OUT_AT_FAILURE', True)
 
 USE_USER_AGENT = getattr(settings, 'AXES_USE_USER_AGENT', False)
 
-#see if the django app is sitting behind a reverse proxy 
+# use a specific username field to retrieve from login POST data
+USERNAME_FORM_FIELD = getattr(settings, 'AXES_USERNAME_FORM_FIELD', 'username')
+
+# use a specific password field to retrieve from login POST data
+PASSWORD_FORM_FIELD = getattr(settings, 'AXES_PASSWORD_FORM_FIELD', 'password')
+
+# see if the django app is sitting behind a reverse proxy
 BEHIND_REVERSE_PROXY = getattr(settings, 'AXES_BEHIND_REVERSE_PROXY', False)
-#if the django app is behind a reverse proxy, look for the ip address using this HTTP header value
+
+# see if the django app is sitting behind a reverse proxy but can be accessed directly
+BEHIND_REVERSE_PROXY_WITH_DIRECT_ACCESS = getattr(settings, 'AXES_BEHIND_REVERSE_PROXY_WITH_DIRECT_ACCESS', False)
+
+# if the django app is behind a reverse proxy, look for the ip address using this HTTP header value
 REVERSE_PROXY_HEADER = getattr(settings, 'AXES_REVERSE_PROXY_HEADER', 'HTTP_X_FORWARDED_FOR')
 #for users behind a firewall with only one ip address, it may not be wise to lock out by host/ip address
 LOCK_OUT_BY_HOST = getattr(settings, 'AXES_LOCKOUT_BY_HOST', True)
-
 COOLOFF_TIME = getattr(settings, 'AXES_COOLOFF_TIME', None)
-if isinstance(COOLOFF_TIME, int):
+if (isinstance(COOLOFF_TIME, int) or isinstance(COOLOFF_TIME, float) ):
     COOLOFF_TIME = timedelta(hours=COOLOFF_TIME)
 
 LOGGER = getattr(settings, 'AXES_LOGGER', 'axes.watch_login')
@@ -59,7 +73,61 @@ IP_BLACKLIST = getattr(settings, 'AXES_IP_BLACKLIST', None)
 
 ERROR_MESSAGE = ugettext_lazy("Please enter a correct username and password. "
                               "Note that both fields are case-sensitive.")
-LOGIN_FORM_KEY = 'this_is_the_login_form'
+
+
+log = logging.getLogger(LOGGER)
+if VERBOSE:
+    log.info('AXES: BEGIN LOG')
+    log.info('Using django-axes ' + axes.get_version())
+
+
+if BEHIND_REVERSE_PROXY:
+    log.debug('Axes is configured to be behind reverse proxy...looking for header value %s', REVERSE_PROXY_HEADER)
+
+
+def is_valid_ip(ip_address):
+    """ Check Validity of an IP address """
+    valid = True
+    try:
+        socket.inet_aton(ip_address.strip())
+    except:
+        valid = False
+    return valid
+
+
+def get_ip_address_from_request(request):
+    """ Makes the best attempt to get the client's real IP or return the loopback """
+    PRIVATE_IPS_PREFIX = ('10.', '172.', '192.', '127.')
+    ip_address = ''
+    x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    if x_forwarded_for and ',' not in x_forwarded_for:
+        if not x_forwarded_for.startswith(PRIVATE_IPS_PREFIX) and is_valid_ip(x_forwarded_for):
+            ip_address = x_forwarded_for.strip()
+    else:
+        ips = [ip.strip() for ip in x_forwarded_for.split(',')]
+        for ip in ips:
+            if ip.startswith(PRIVATE_IPS_PREFIX):
+                continue
+            elif not is_valid_ip(ip):
+                continue
+            else:
+                ip_address = ip
+                break
+    if not ip_address:
+        x_real_ip = request.META.get('HTTP_X_REAL_IP', '')
+        if x_real_ip:
+            if not x_real_ip.startswith(PRIVATE_IPS_PREFIX) and is_valid_ip(x_real_ip):
+                ip_address = x_real_ip.strip()
+    if not ip_address:
+        remote_addr = request.META.get('REMOTE_ADDR', '')
+        if remote_addr:
+            if not remote_addr.startswith(PRIVATE_IPS_PREFIX) and is_valid_ip(remote_addr):
+                ip_address = remote_addr.strip()
+            if remote_addr.startswith(PRIVATE_IPS_PREFIX) and is_valid_ip(remote_addr):
+                ip_address = remote_addr.strip()
+    if not ip_address:
+            ip_address = '127.0.0.1'
+    return ip_address
 
 
 def get_ip(request):
@@ -83,77 +151,86 @@ def get_ip(request):
         ip = request.META.get('REMOTE_ADDR', '')    
     return ip
 
+
 def get_lockout_url():
     return getattr(settings, 'AXES_LOCKOUT_URL', None)
 
 
-def query2str(items):
+def query2str(items, max_length=1024):
     """Turns a dictionary into an easy-to-read list of key-value pairs.
 
     If there's a field called "password" it will be excluded from the output.
+
+    The length of the output is limited to max_length to avoid a DoS attack.
     """
 
     kvs = []
     for k, v in items:
-        if k != 'password':
-            kvs.append(u'%s=%s' % (k, v))
+        if k != PASSWORD_FORM_FIELD:
+            kvs.append(six.u('%s=%s') % (k, v))
 
-    return '\n'.join(kvs)
+    return '\n'.join(kvs)[:max_length]
 
 
 def ip_in_whitelist(ip):
     if IP_WHITELIST is not None:
         return ip in IP_WHITELIST
-    else:
-        return False
+
+    return False
 
 
 def ip_in_blacklist(ip):
     if IP_BLACKLIST is not None:
         return ip in IP_BLACKLIST
-    else:
-        return False
 
+    return False
 
-log = logging.getLogger(LOGGER)
-if VERBOSE:
-    log.info('AXES: BEGIN LOG')
-    log.info('Using django-axes ' + axes.get_version())
 
 def is_user_lockable(request):
-    """ Check if the user has a profile with nolockout
+    """Check if the user has a profile with nolockout
     If so, then return the value to see if this user is special
-    and doesn't get their account locked out """
-    username = request.POST.get('username', None)
+    and doesn't get their account locked out
+    """
     try:
-        user = User.objects.get(username=username)
+        field = getattr(User, 'USERNAME_FIELD', 'username')
+        kwargs = {
+            field: request.POST.get(USERNAME_FORM_FIELD)
+        }
+        user = User.objects.get(**kwargs)
     except User.DoesNotExist:
         # not a valid user
         return True
-    try:
-        profile = user.get_profile()
-    except:
-        # no profile
-        return True
 
-    if hasattr(profile, 'nolockout'):
+    if hasattr(user, 'nolockout'):
         # need to revert since we need to return
         # false for users that can't be blocked
-        return not profile.nolockout
-    else:
-        return True
+        return not user.nolockout
 
-def get_user_attempts(request):
-    """
-    Returns access attempt record if it exists.
+    elif hasattr(settings, 'AUTH_PROFILE_MODULE'):
+        try:
+            profile = user.get_profile()
+            if hasattr(profile, 'nolockout'):
+                # need to revert since we need to return
+                # false for users that can't be blocked
+                return not profile.nolockout
+
+        except (SiteProfileNotAvailable, ObjectDoesNotExist, AttributeError):
+            # no profile
+            return True
+
+    # Default behavior for a user to be lockable
+    return True
+
+def _get_user_attempts(request):
+    """Returns access attempt record if it exists.
     Otherwise return None.
     """
     ip = get_ip(request)
-        
-    username = request.POST.get('username', None)
+
+    username = request.POST.get(USERNAME_FORM_FIELD, None)
 
     if USE_USER_AGENT:
-        ua = request.META.get('HTTP_USER_AGENT', '<unknown>')
+        ua = request.META.get('HTTP_USER_AGENT', '<unknown>')[:255]
         attempts = AccessAttempt.objects.filter(
             user_agent=ua, ip_address=ip, username=username, trusted=True
         )
@@ -173,11 +250,26 @@ def get_user_attempts(request):
             params['username'] = username
             attempts |= AccessAttempt.objects.filter(**params)
 
+    return attempts
+
+def get_user_attempts(request):
+    objects_deleted = False
+    attempts = _get_user_attempts(request)
+
     if COOLOFF_TIME:
         for attempt in attempts:
-            if attempt.attempt_time + COOLOFF_TIME < datetime.now() \
-               and attempt.trusted is False:
-                attempt.delete()
+            if attempt.attempt_time + COOLOFF_TIME < datetime.now():
+                if attempt.trusted:
+                    attempt.failures_since_start = 0
+                    attempt.save()
+                else:
+                    attempt.delete()
+                    objects_deleted = True
+
+    # If objects were deleted, we need to update the queryset to reflect this,
+    # so force a reload.
+    if objects_deleted:
+        attempts = _get_user_attempts(request)
 
     return attempts
 
@@ -192,7 +284,7 @@ def watch_login(func):
         if func.__name__ != 'decorated_login' and VERBOSE:
             log.info('AXES: Calling decorated function: %s' % func.__name__)
             if args:
-                log.info('args: %s' % args)
+                log.info('args: %s' % str(args))
             if kwargs:
                 log.info('kwargs: %s' % kwargs)
 
@@ -202,7 +294,7 @@ def watch_login(func):
         # also no need to keep accessing these:
         # ip = request.META.get('REMOTE_ADDR', '')
         # ua = request.META.get('HTTP_USER_AGENT', '<unknown>')
-        # username = request.POST.get('username', None)
+        # username = request.POST.get(USERNAME_FORM_FIELD, None)
 
         # if the request is currently under lockout, do not proceed to the
         # login function, go directly to lockout url, do not pass go, do not
@@ -224,16 +316,26 @@ def watch_login(func):
 
         if request.method == 'POST':
             # see if the login was successful
+
             login_unsuccessful = (
                 response and
                 not response.has_header('location') and
                 response.status_code != 302
             )
-            log_access_request(request, login_unsuccessful)
+
+            access_log = AccessLog.objects.create(
+                user_agent=request.META.get('HTTP_USER_AGENT', '<unknown>')[:255],
+                ip_address=get_ip(request),
+                username=request.POST.get(USERNAME_FORM_FIELD, None),
+                http_accept=request.META.get('HTTP_ACCEPT', '<unknown>'),
+                path_info=request.META.get('PATH_INFO', '<unknown>'),
+                trusted=not login_unsuccessful,
+            )
             if check_request(request, login_unsuccessful):
                 return response
 
             return lockout_response(request)
+
         return response
 
     return decorated_login
@@ -281,21 +383,9 @@ def is_already_locked(request):
     else:
         return False
 
-def log_access_request(request, login_unsuccessful):
-    """ Log the access attempt """
-    access_log = AccessLog()
-    access_log.user_agent = request.META.get('HTTP_USER_AGENT', '<unknown>')
-    access_log.ip_address = get_ip(request)
-    access_log.username = request.POST.get('username', None)
-    access_log.http_accept = request.META.get('HTTP_ACCEPT', '<unknown>')
-    access_log.path_info = request.META.get('PATH_INFO', '<unknown>')
-    access_log.trusted = not login_unsuccessful
-    access_log.save()
-
-
 def check_request(request, login_unsuccessful):
     ip_address = get_ip(request)
-    username = request.POST.get('username', None)
+    username = request.POST.get(USERNAME_FORM_FIELD, None)
     failures = 0
     attempts = get_user_attempts(request)
 
@@ -346,10 +436,11 @@ def check_request(request, login_unsuccessful):
     user_lockable = is_user_lockable(request)
     # no matter what, we want to lock them out if they're past the number of
     # attempts allowed, unless the user is set to notlockable
-    if failures >= FAILURE_LIMIT and LOCK_OUT_AT_FAILURE and user_lockable:
+    if failures > FAILURE_LIMIT and LOCK_OUT_AT_FAILURE and user_lockable:
         # We log them out in case they actually managed to enter the correct
         # password
-        logout(request)
+        if hasattr(request, 'user') and request.user.is_authenticated():
+            logout(request)
         log.warn('AXES: locked out %s after repeated login attempts.' %
                  (ip_address,))
         # send signal when someone is locked out.
@@ -367,8 +458,8 @@ def check_request(request, login_unsuccessful):
 
 def create_new_failure_records(request, failures, username=None):
     ip = get_ip(request)
-    ua = request.META.get('HTTP_USER_AGENT', '<unknown>')
-    username = request.POST.get('username', username)
+    ua = request.META.get('HTTP_USER_AGENT', '<unknown>')[:255]
+    username = request.POST.get(USERNAME_FORM_FIELD, None)
 
     params = {
         'user_agent': ua,
@@ -389,8 +480,8 @@ def create_new_failure_records(request, failures, username=None):
 
 def create_new_trusted_record(request):
     ip = get_ip(request)
-    ua = request.META.get('HTTP_USER_AGENT', '<unknown>')
-    username = request.POST.get('username', None)
+    ua = request.META.get('HTTP_USER_AGENT', '<unknown>')[:255]
+    username = request.POST.get(USERNAME_FORM_FIELD, None)
 
     if not username:
         return False
@@ -406,102 +497,3 @@ def create_new_trusted_record(request):
         failures_since_start=0,
         trusted=True
     )
-
-
-def _display_login_form(request, error_message=''):
-    request.session.set_test_cookie()
-    return render_to_response('admin/login.html', {
-        'title': _('Log in'),
-        'app_path': request.get_full_path(),
-        'error_message': error_message
-    }, context_instance=template.RequestContext(request))
-
-
-def staff_member_required(view_func):
-    """
-    Decorator for views that checks that the user is logged in and is a staff
-    member, displaying the login page if necessary.  Mostly quoted from
-    django.contrib.auth.decorators.staff_member_required.  License for
-    Django-extracted code follows:
-
-    Copyright (c) Django Software Foundation and individual contributors.  All
-    rights reserved.
-
-    Redistribution and use in source and binary forms, with or without
-    modification, are permitted provided that the following conditions are met:
-
-        1. Redistributions of source code must retain the above copyright
-           notice, this list of conditions and the following disclaimer.
-
-        2. Redistributions in binary form must reproduce the above copyright
-           notice, this list of conditions and the following disclaimer in the
-           documentation and/or other materials provided with the distribution.
-
-        3. Neither the name of Django nor the names of its contributors may be
-           used to endorse or promote products derived from this software
-           without specific prior written permission.
-
-    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
-    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-    POSSIBILITY OF SUCH DAMAGE."""
-
-    def _checklogin(request, *args, **kwargs):
-        if request.user.is_active and request.user.is_staff:
-            # The user is valid. Continue to the admin page.
-            return view_func(request, *args, **kwargs)
-
-        assert hasattr(request, 'session'), "The Django admin requires session middleware to be installed. Edit your MIDDLEWARE_CLASSES setting to insert 'django.contrib.sessions.middleware.SessionMiddleware'."
-
-        # If this isn't already the login page, display it.
-        if LOGIN_FORM_KEY not in request.POST:
-            if request.POST:
-                message = _("Please log in again, because your session has expired.")
-            else:
-                message = ""
-            return _display_login_form(request, message)
-
-        # Check that the user accepts cookies.
-        if not request.session.test_cookie_worked():
-            message = _("Looks like your browser isn't configured to accept cookies. Please enable cookies, reload this page, and try again.")
-            return _display_login_form(request, message)
-        else:
-            request.session.delete_test_cookie()
-
-        # Check the password.
-        username = request.POST.get('username', None)
-        password = request.POST.get('password', None)
-        user = authenticate(username=username, password=password)
-        # next two lines are where this differs from django's
-        # @staff_member_required -- ready?
-        if not check_request(request, not user):
-            return lockout_response(request)
-        if user is None:
-            message = ERROR_MESSAGE
-            if '@' in username:
-                # Mistakenly entered e-mail address instead of username? Look it up.
-                users = list(User.objects.filter(email=username))
-                if len(users) == 1 and users[0].check_password(password):
-                    message = _("Your e-mail address is not your username. Try '%s' instead.") % users[0].username
-                else:
-                    # Either we cannot find the user, or if more than 1
-                    # we cannot guess which user is the correct one.
-                    message = _("Usernames cannot contain the '@' character.")
-            return _display_login_form(request, message)
-
-        # The user data is correct; log in the user in and continue.
-        else:
-            if user.is_active and user.is_staff:
-                login(request, user)
-                return http.HttpResponseRedirect(request.get_full_path())
-            else:
-                return _display_login_form(request, ERROR_MESSAGE)
-
-    return wraps(view_func)(_checklogin)

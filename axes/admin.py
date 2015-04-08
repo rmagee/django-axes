@@ -1,13 +1,35 @@
 from django.contrib import admin
-from axes.models import AccessAttempt, AccessLog
+
+from axes.models import AccessLog
+from axes.models import AccessAttempt
 
 
 class AccessAttemptAdmin(admin.ModelAdmin):
-    list_display = ('username', 'attempt_time', 'ip_address', 'user_agent', 'path_info',
-                    'failures_since_start', 'trusted')
-    list_filter = ['attempt_time', 'ip_address', 'path_info']
-    search_fields = ['ip_address', 'user_agent', 'username', 'path_info']
+    list_display = (
+        'attempt_time',
+        'ip_address',
+        'user_agent',
+        'username',
+        'path_info',
+        'failures_since_start',
+    )
+
+    list_filter = [
+        'attempt_time',
+        'ip_address',
+        'username',
+        'path_info',
+    ]
+
+    search_fields = [
+        'ip_address',
+        'username',
+        'user_agent',
+        'path_info',
+    ]
+
     date_hierarchy = 'attempt_time'
+
     fieldsets = (
         (None, {
             'fields': ('username', 'path_info', 'failures_since_start', 'attempt_time', 'trusted')
@@ -23,12 +45,33 @@ class AccessAttemptAdmin(admin.ModelAdmin):
 
 admin.site.register(AccessAttempt, AccessAttemptAdmin)
 
+
 class AccessLogAdmin(admin.ModelAdmin):
-    list_display = ('attempt_time', 'username', 'logout_time', 'ip_address', 
-        'user_agent', 'path_info')
-    list_filter = ['attempt_time', 'logout_time', 'path_info']
-    search_fields = ['ip_address', 'user_agent', 'username', 'path_info']
+    list_display = (
+        'attempt_time',
+        'logout_time',
+        'ip_address',
+        'username',
+        'user_agent',
+        'path_info',
+    )
+
+    list_filter = [
+        'attempt_time',
+        'logout_time',
+        'ip_address',
+        'username',
+        'path_info',
+    ]
+
+    search_fields = [
+        'ip_address',
+        'user_agent',
+        'username',
+        'path_info',
+    ]
     date_hierarchy = 'attempt_time'
+
     fieldsets = (
         (None, {
             'fields': ('path_info',)
